@@ -5,7 +5,12 @@
 用 feaLib 构建 GSUB/GDEF，最后设置命名并保存。
 """
 
+import copy
+import math
+
 from fontTools.ttLib import TTFont
+from fontTools.ttLib.tables import ttProgram
+from fontTools.ttLib.tables._g_l_y_f import GlyphCoordinates
 
 from tham_mapping import sangdangk_35_table
 from ligature_creator import LigatureCreator
@@ -29,6 +34,288 @@ def _copy_glyph(template, font, src_name, dst_name, unicode_val):
         for table in font['cmap'].tables:
             if table.isUnicode():
                 table.cmap[unicode_val] = dst_name
+
+
+# ---------------------------------------------------------------------------
+# virama（uni1A60）缩放补充
+# ---------------------------------------------------------------------------
+# Sangdang 源字体普遍没有 virama 字形，需要从模板字体 A Tai Tham KH New 补。
+# 但模板 UPM=2048、目标字体多为 UPM=1000，直接复制会得到一个大了约一倍的字形，
+# 视觉上又大又粗。而且各 Sangdang 字体本身的笔画粗细差异很大（细体到特粗体），
+# 等比缩放只能解决「大小」，不能解决「粗细」。
+#
+# 这里的做法分两步：
+#   1) 大小匹配：按参考字母（uni1A20 等）的轮廓高度比例做等比缩放；
+#   2) 粗细匹配：目标字母笔画宽 / 模板字母笔画宽 的比例，决定 virama 主轮廓
+#      （十Campo字形）需要加粗或减细多少。加粗/减细通过把轮廓上每个点沿外法线
+#      方向平移来实现（类似 FreeType 的 FT_Outline_Embolden 思路）。
+# ---------------------------------------------------------------------------
+
+# 用来测「参考字母高度和笔画宽度」的字形：都是单轮廓、无内孔的简单字母，
+# 在所有 Sangdang 源字体里都存在（'!'、'F'、'ò'、'S' 借用位）。
+_REFERENCE_LETTERS = ['uni1A20', 'uni1A36', 'uni1A63', 'uni1A45']
+
+
+def _letter_metrics(font, names=_REFERENCE_LETTERS):
+    """测量参考字母的轮廓高度和平均笔画宽度（2*面积/周长），返回 (height, stroke)。
+
+    取中位数，避免单个字形异常导致偏差。
+    """
+    from fontTools.pens.areaPen import AreaPen
+    from fontTools.pens.boundsPen import BoundsPen
+    from fontTools.pens.perimeterPen import PerimeterPen
+
+    gs = font.getGlyphSet()
+    order = set(font.getGlyphOrder())
+    hs, ws = [], []
+    for n in names:
+        if n not in order:
+            continue
+        b = BoundsPen(gs); gs[n].draw(b)
+        a = AreaPen(gs); gs[n].draw(a)
+        p = PerimeterPen(gs); gs[n].draw(p)
+        if b.bounds is None or not p.value:
+            continue
+        hs.append(b.bounds[3] - b.bounds[1])
+        ws.append(2 * abs(a.value) / p.value)
+    if not hs:
+        return None, None
+    hs.sort(); ws.sort()
+    return hs[len(hs) // 2], ws[len(ws) // 2]
+
+
+def _min_chord_width(pts, samples=80):
+    """用水平扫描线测轮廓的典型笔画厚度（中位数弦宽）。
+
+    对「十字」「条状」这类笔画宽度一致的形状效果好；对复杂字形只作参考。
+    """
+    ys = [p[1] for p in pts]
+    y0, y1 = min(ys), max(ys)
+    n = len(pts)
+    widths = []
+    for i in range(1, samples):
+        y = y0 + (y1 - y0) * i / samples
+        crossings = []
+        for j in range(n):
+            x1, a1 = pts[j]
+            x2, a2 = pts[(j + 1) % n]
+            if (a1 <= y < a2) or (a2 <= y < a1):
+                t = (y - a1) / (a2 - a1)
+                crossings.append(x1 + t * (x2 - x1))
+        crossings.sort()
+        for k in range(0, len(crossings) - 1, 2):
+            widths.append(crossings[k + 1] - crossings[k])
+    if not widths:
+        return 0.0
+    widths.sort()
+    return widths[len(widths) // 2]
+
+
+def _embolden_contour(pts, distance):
+    """把轮廓上每个点沿外法线方向平移 distance（>0 加粗、<0 减细）。
+
+    用有向面积判断轮廓朝向（外轮廓顺时针/逆时针决定法线方向），
+    每个点取前后两条边的左法线的角平分线方向。
+    """
+    n = len(pts)
+    if n < 3 or not distance:
+        return list(pts)
+    area2 = sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+                for i in range(n))
+    # 面积>0 逆时针：内部在行进方向左侧，外侧在右侧 -> outward = -left_normal
+    # 面积<0 顺时针：内部在右侧，外侧在左侧 -> outward = +left_normal
+    outward = -1.0 if area2 > 0 else 1.0
+    out = []
+    for i in range(n):
+        px, py = pts[(i - 1) % n]
+        cx, cy = pts[i]
+        nx, ny = pts[(i + 1) % n]
+        d1x, d1y = cx - px, cy - py
+        d2x, d2y = nx - cx, ny - cy
+        n1 = math.hypot(d1x, d1y) or 1e-9
+        n2 = math.hypot(d2x, d2y) or 1e-9
+        l1x, l1y = -d1y / n1, d1x / n1   # 第一条边的左法线
+        l2x, l2y = -d2y / n2, d2x / n2   # 第二条边的左法线
+        bx, by = l1x + l2x, l1y + l2y    # 角平分线方向
+        bl = math.hypot(bx, by)
+        if bl < 1e-9:
+            bx, by, bl = l1x, l1y, 1.0
+        out.append((cx + outward * bx / bl * distance,
+                    cy + outward * by / bl * distance))
+    return out
+
+
+def _copy_virama_scaled(template, font, src_name='uni1A60', dst_name='uni1A60',
+                        unicode_val=0x1A60):
+    """把模板里的 virama 按目标字体的大小和粗细缩放后复制进来。
+
+    与 _copy_glyph 不同：先按高度比例等比缩放，再按笔画宽度比例加粗/减细，
+    使 virama 在该字体里看起来大小、粗细都与其他字母一致。
+    """
+    th, tstroke = _letter_metrics(font)
+    ph, pstroke = _letter_metrics(template)
+    if th is None or ph is None or not ph or not pstroke:
+        # 参考字形缺失时退化为直接复制
+        _copy_glyph(template, font, src_name, dst_name, unicode_val)
+        return
+
+    scale = th / ph
+    # 粗细比例：比较「笔画/高度」而非原始笔画宽，这样模板(2048)和目标(1000)
+    # 的 UPM 差异不会混进来。等比缩放已经乘了 th/ph，所以这里再乘的是
+    # 额外的粗细修正 = (tstroke/ph) / (pstroke/th)。
+    weight_factor = (tstroke * ph) / (pstroke * th)
+
+    tglyph = template['glyf'][src_name]
+    coords, ends, flags = tglyph.getCoordinates(template['glyf'])
+
+    # 模板 virama 主轮廓（第一个轮廓 = 十字标）的笔画厚度
+    main_pts = [coords[i] for i in range(ends[0] + 1)]
+    mark_stroke = _min_chord_width(main_pts)
+
+    # 等比缩放后 virama 笔画 = mark_stroke * scale；
+    # 期望笔画 = mark_stroke * scale * weight_factor；
+    # embolden 距离 = (期望 - 实际) / 2（两侧各移动一半）。
+    delta = mark_stroke * scale * (weight_factor - 1.0) / 2.0
+
+    new_g = copy.deepcopy(tglyph)
+    # 坐标统一缩放
+    scaled = [(x * scale, y * scale) for x, y in coords]
+    if delta:
+        result = []
+        idx = 0
+        for ci, end in enumerate(ends):
+            contour = scaled[idx:end + 1]
+            # 只对主轮廓（十字标）做加粗/减细；虚线圆的圆点是装饰性的，
+            # 若同样缩放粗细，细体字体里圆点会缩到几乎看不见。
+            d = delta if ci == 0 else 0.0
+            result.extend(_embolden_contour(contour, d))
+            idx = end + 1
+        scaled = result
+    new_g.coordinates = GlyphCoordinates(scaled)
+    new_g.endPtsOfContours = list(ends)
+    new_g.flags = bytearray(flags)
+    # 坐标变了，原 hinting 指令不再适用，清空
+    new_g.program = ttProgram.Program()
+    new_g.program.fromBytecode(b"")
+    new_g.recalcBounds(template['glyf'])
+
+    order = font.getGlyphOrder()
+    if dst_name not in order:
+        order.append(dst_name)
+        font.setGlyphOrder(order)
+    font['glyf'][dst_name] = new_g
+
+    adv, lsb = template['hmtx'][src_name]
+    font['hmtx'][dst_name] = (int(round(adv * scale)), int(round(lsb * scale)))
+
+    if unicode_val is not None and 'cmap' in font:
+        for table in font['cmap'].tables:
+            if table.isUnicode():
+                table.cmap[unicode_val] = dst_name
+
+
+# 从 Noto Sans Tai Tham 补充的傣文符号码位。
+_SUPPLEMENT_SIGNS = [0x1AA0, 0x1AA1, 0x1AA2, 0x1AA3, 0x1AA4,
+                     0x1AA5, 0x1AA6, 0x1AAC, 0x1AAD]
+
+
+def _glyph_stroke(font, name):
+    """字形的平均笔画宽度（2*墨迹面积/周长），粗略衡量笔画粗细。
+
+    墨迹面积按每个轮廓的 |面积| 求和（不能用净面积，否则带内孔的字形会被
+    严重低估）。只处理简单字形；复合字形走另外的分支，不会调用到这里。
+    """
+    from fontTools.pens.perimeterPen import PerimeterPen
+
+    gs = font.getGlyphSet()
+    p = PerimeterPen(gs); gs[name].draw(p)
+    if not p.value:
+        return 0.0
+
+    glyf = font['glyf']
+    coords, ends, _flags = glyf[name].getCoordinates(glyf)
+    total_area = 0.0
+    idx = 0
+    for end in ends:
+        pts = coords[idx:end + 1]
+        n = len(pts)
+        a2 = sum(pts[k][0] * pts[(k + 1) % n][1] - pts[(k + 1) % n][0] * pts[k][1]
+                 for k in range(n))
+        total_area += abs(a2) / 2.0
+        idx = end + 1
+    return 2 * total_area / p.value
+
+
+def _copy_signs_from_noto(noto, font):
+    """从 Noto Sans Tai Tham 补充 U+1AA0-1AA6、U+1AAC、U+1AAD，并按字体缩放大小、调节粗细。
+
+    Noto 是 Regular 字重，各 Sangdang 字体从极细到特粗都有，直接复制会粗细不搭。
+    处理方式和 virama 一样：先按参考字母高度比例等比缩放，再按笔画/高度比例调节粗细。
+    """
+    th, tstroke = _letter_metrics(font)
+    ph, pstroke = _letter_metrics(noto)
+    if th is None or ph is None or not ph or not pstroke:
+        return
+
+    scale = th / ph
+    weight_factor = (tstroke * ph) / (pstroke * th)
+
+    cmap = noto.getBestCmap()
+
+    for cp in _SUPPLEMENT_SIGNS:
+        src_name = cmap.get(cp)
+        if not src_name or src_name not in noto.getGlyphOrder():
+            continue
+        dst_name = src_name
+        if dst_name in font.getGlyphOrder():
+            continue  # 目标字体已有，跳过
+
+        src_glyph = noto['glyf'][src_name]
+        new_g = copy.deepcopy(src_glyph)
+
+        if src_glyph.numberOfContours == -1:
+            # 复合字形（如 uni1AA2 引用了 uni1A48、uni1A7C）：只缩放组件偏移，
+            # 组件本身用目标字体里已有的字形，其粗细已自动匹配目标字体。
+            for comp in new_g.components:
+                comp.x = comp.x * scale
+                comp.y = comp.y * scale
+        else:
+            # 简单字形：等比缩放 + 按粗细比例加粗/减细。
+            coords, ends, flags = new_g.getCoordinates(noto['glyf'])
+            stroke = _glyph_stroke(noto, src_name)
+            delta = stroke * scale * (weight_factor - 1.0) / 2.0
+            scaled = [(x * scale, y * scale) for x, y in coords]
+            if delta:
+                result = []
+                idx = 0
+                for end in ends:
+                    contour = scaled[idx:end + 1]
+                    result.extend(_embolden_contour(contour, delta))
+                    idx = end + 1
+                scaled = result
+            new_g.coordinates = GlyphCoordinates(scaled)
+            new_g.endPtsOfContours = list(ends)
+            new_g.flags = bytearray(flags)
+            # 坐标变了，原 hinting 指令不再适用，清空
+            new_g.program = ttProgram.Program()
+            new_g.program.fromBytecode(b"")
+
+        # 重算包围盒；复合字形需要目标字体的 glyf 来解析组件
+        new_g.recalcBounds(font['glyf'])
+
+        order = font.getGlyphOrder()
+        if dst_name not in order:
+            order.append(dst_name)
+            font.setGlyphOrder(order)
+        font['glyf'][dst_name] = new_g
+
+        adv, lsb = noto['hmtx'][src_name]
+        font['hmtx'][dst_name] = (int(round(adv * scale)), int(round(lsb * scale)))
+
+        if 'cmap' in font:
+            for table in font['cmap'].tables:
+                if table.isUnicode():
+                    table.cmap[cp] = dst_name
 
 
 def _remap_glyphs(font):
@@ -228,13 +515,16 @@ def _add_latin_characters(template, font):
         _copy_glyph(template, font, src_name, dst_name, cp)
 
 
-def convert_sangdang(font_numbers, template_path='./Tai-Tham-Unicode-for-Mac/A Tai Tham KH New.ttf'):
+def convert_sangdang(font_numbers, template_path='./Tai-Tham-Unicode-for-Mac/A Tai Tham KH New.ttf',
+                     noto_path='./NotoTaiTham/fonts/NotoSansTaiTham/full/ttf/NotoSansTaiTham-Regular.ttf'):
     """把给定的 Sangdang 字体编号列表转换成 Unicode 字体。
 
     font_numbers: 要转换的字体编号（如 [14] 或 range(41)）。
-    template_path: 模板字体（ATaiThamKHNew-Regular 导出的 ttf），用于补缺失字形。
+    template_path: 模板字体（ATaiThamKHNew-Regular 导出的 ttf），用于补缺失字形（如 virama）。
+    noto_path: Noto Sans Tai Tham，用于补充 U+1AA0-1AA6、U+1AAC、U+1AAD 等符号。
     """
     template = TTFont(template_path)
+    noto = TTFont(noto_path)
 
     for i in font_numbers:
         print(i)
@@ -250,10 +540,13 @@ def convert_sangdang(font_numbers, template_path='./Tai-Tham-Unicode-for-Mac/A T
         for name in prebase_glyphs:
             lig.add_prebase([name], name, False)
 
-        # 补 virama 附标 uni1A60
+        # 补 virama 附标 uni1A60（按目标字体大小和粗细缩放，不能直接复制）
         if 'uni1A60' not in font.getGlyphOrder():
-            _copy_glyph(template, font, 'uni1A60', 'uni1A60', 0x1A60)
+            _copy_virama_scaled(template, font)
         lig.set_glyphclass('uni1A60', 'mark')
+
+        # 补 Noto 里的傣文符号 U+1AA0-1AA6、U+1AAC、U+1AAD（同样按字体缩放、调粗细）
+        _copy_signs_from_noto(noto, font)
 
         # 第二遍：为带「连字序列」的条目登记 ligature 规则。
         # input 里含有其他连字产物的（如 uni1A45.3F <- uni1A45.sub1 + uni1A3F.sub1，
@@ -290,3 +583,4 @@ def convert_sangdang(font_numbers, template_path='./Tai-Tham-Unicode-for-Mac/A T
         font.save('sangdangk.%02dunicode-Normal.ttf' % i)
 
     template.close()
+    noto.close()

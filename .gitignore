@@ -1,0 +1,17 @@
+# 虚拟环境 / Python 缓存
+.venv/
+__pycache__/
+*.pyc
+pyvenv.cfg
+
+# 系统文件
+.DS_Store
+
+# 字体文件（源字体、参考字体、生成的输出字体均为二进制数据，不入库）
+*.ttf
+
+# 输入/参考数据目录（体积大，不入库）
+NotoTaiTham/
+PayapLanna-1.000/
+Sangdang-Non-Unicode-for-Mac/
+Tai-Tham-Unicode-for-Mac/
